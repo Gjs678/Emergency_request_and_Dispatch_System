@@ -1,0 +1,78 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RequestStatus {
+  PENDING
+  ASSIGNED
+  EN_ROUTE
+  ON_SCENE
+  RESOLVED
+  CANCELLED
+}
+
+enum ResponderType {
+  AMBULANCE
+  FIRE_ENGINE
+  POLICE_UNIT
+  SWAT
+  HAZMAT
+}
+
+enum ResponderStatus {
+  AVAILABLE
+  DISPATCHED
+  ON_SCENE
+  OFF_DUTY
+}
+
+model EmergencyRequest {
+  id            String        @id @default(uuid())
+  userId        String
+  lat           Float
+  lng           Float
+  description   String
+  priorityScore Int           // 1 (Low) to 5 (Critical)
+  status        RequestStatus @default(PENDING)
+  responderId   String?
+  riskFactors   String[]
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  responder    Responder?    @relation(fields: [responderId], references: [id])
+  dispatchLogs DispatchLog[]
+
+  @@map("emergency_requests")
+}
+
+model Responder {
+  id        String          @id @default(uuid())
+  name      String
+  type      ResponderType
+  status    ResponderStatus @default(AVAILABLE)
+  lat       Float
+  lng       Float
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  assignedRequests EmergencyRequest[]
+
+  @@map("responders")
+}
+
+model DispatchLog {
+  id          String   @id @default(uuid())
+  requestId   String
+  responderId String
+  action      String
+  timestamp   DateTime @default(now())
+
+  request EmergencyRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+
+  @@map("dispatch_logs")
+}

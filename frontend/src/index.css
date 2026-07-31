@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #0B0F17;
+    color: #F1F5F9;
+    font-family: 'Inter', sans-serif;
+  }
+}
+
+/* Custom Scrollbar for Tactical Command Panels */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0F172A;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Dark Mode Leaflet Map Styling */
+.leaflet-container {
+  background: #090D14 !important;
+  border-radius: 0.75rem;
+  width: 100%;
+  height: 100%;
+}
+.leaflet-tile {
+  filter: brightness(0.6) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7);
+}
+.leaflet-popup-content-wrapper {
+  background: #131B2A !important;
+  color: #F8FAFC !important;
+  border: 1px solid #1E293B;
+  border-radius: 8px;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.7);
+}
+.leaflet-popup-tip {
+  background: #131B2A !important;
+}
+
+/* Priority Pulse Glow Effects */
+.glow-level-5 {
+  box-shadow: 0 0 15px rgba(239, 68, 68, 0.6);
+}
+.glow-level-4 {
+  box-shadow: 0 0 12px rgba(249, 115, 22, 0.5);
+}
+.glow-level-3 {
+  box-shadow: 0 0 10px rgba(234, 179, 8, 0.4);
+}
+
+@keyframes scanline {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(1000%); }
+}
+.animate-scanline {
+  animation: scanline 8s linear infinite;
+}
+/* Fix Leaflet map cursor & container panning bounds */
+.leaflet-container {
+  width: 100% !important;
+  height: 100% !important;
+  cursor: grab !important;
+}
+
+.leaflet-container:active {
+  cursor: grabbing !important;
+}
