@@ -1,0 +1,1105 @@
+================================================================================
+  EMERGENCY COMMAND CENTER DISPATCH PLATFORM
+  SYSTEM ARCHITECTURE & TECHNICAL SPECIFICATIONS
+  Document Class: Internal Engineering Reference
+  Version: 1.0
+================================================================================
+
+
+================================================================================
+SECTION 1: EXECUTIVE SYSTEM OVERVIEW
+================================================================================
+
+1.1 PLATFORM PURPOSE
+--------------------
+The Emergency Command Center Dispatch platform is a real-time operations
+console used by 911/112-style dispatch centers to receive, classify,
+prioritize, and assign field responder units (ambulances, fire trucks,
+police cruisers) to incoming emergency incidents. The system replaces
+manual radio-and-whiteboard coordination with a live, synchronized digital
+command surface that every dispatcher on shift sees simultaneously.
+
+1.2 THE PROBLEM SOLVED
+-----------------------
+Traditional dispatch relies on:
+  - Verbal radio communication (slow, error-prone, no audit trail)
+  - Static whiteboards or spreadsheets for unit status (no real-time sync)
+  - Manual "closest unit" guesswork (inaccurate, wastes response time)
+  - No automated triage of incoming call severity
+
+This platform solves each of these problems with:
+  - A structured digital incident intake pipeline
+  - An NLP-based severity classifier that auto-prioritizes incidents
+  - A live, shared state that every connected dispatcher sees instantly
+  - A mathematically-computed "nearest unit" recommendation engine
+
+1.3 END-TO-END DISPATCH WORKFLOW (PLAIN ENGLISH WALKTHROUGH)
+--------------------------------------------------------------
+Step 1 — INTAKE
+  A 911 call is logged into the system as free text (e.g., "Man collapsed,
+  not breathing, corner of 5th and Main"). This text is submitted to the
+  NLP Incident Classifier.
+
+Step 2 — CLASSIFICATION
+  The NLP model reads the text and assigns:
+    - A category (Medical, Fire, Police, Hazard, Traffic)
+    - A severity score (1-10, where 10 is life-threatening)
+  This severity score becomes the incident's "priority weight."
+
+Step 3 — QUEUEING
+  The incident is inserted into a Redis Sorted Set (ZADD) using the
+  severity score as the sort key. This means the most critical incident
+  is ALWAYS at the top of the queue, retrieved instantly, regardless of
+  how many incidents are in the system.
+
+Step 4 — BROADCAST
+  The server publishes a "new_incident" event over Redis Pub/Sub, which
+  the Socket.io layer relays to every connected dispatcher's browser in
+  real time. No one needs to refresh their screen.
+
+Step 5 — VISUALIZATION
+  The incident appears simultaneously in two places:
+    - The Priority Queue panel (a sorted list, top = most urgent)
+    - The Command Map panel (a Leaflet map pin at the incident's GPS
+      coordinates)
+
+Step 6 — PROXIMITY CALCULATION
+  For every available responder unit, the system calculates the
+  straight-line ("as the crow flies") distance to the incident using the
+  Haversine Formula, and sorts units by distance in the Responder Panel.
+
+Step 7 — ASSIGNMENT (DRAG-AND-DROP)
+  The dispatcher drags the recommended (or any) responder unit card from
+  the Fleet Panel and drops it onto the incident card. This single
+  physical gesture triggers the entire assignment pipeline: state update,
+  database write, cache update, and a Redis Pub/Sub "dispatch" event that
+  every other dispatcher's screen receives instantly.
+
+Step 8 — LIFECYCLE TRACKING
+  The incident then moves through a formal state machine:
+  PENDING -> ASSIGNED -> EN_ROUTE -> ON_SCENE -> RESOLVED
+  Each transition is reflected live across all connected clients.
+
+1.4 CORE DESIGN PHILOSOPHY
+----------------------------
+The entire system is engineered around three non-negotiable principles:
+
+  A) LOW LATENCY
+     Every meaningful action (new incident, assignment, status change)
+     must appear on every dispatcher's screen in well under 500
+     milliseconds. This is why Redis (an in-memory data store) is used
+     instead of hitting a disk-based SQL database for every read, and why
+     Socket.io (persistent bidirectional connections) is used instead of
+     traditional HTTP polling.
+
+  B) DYNAMIC PRIORITY ROUTING
+     The system never uses simple "first-come-first-served" ordering.
+     Priority is continuously recalculated based on severity score, and
+     the sorted queue structure guarantees the most dangerous situation
+     is always presented first, automatically, without manual sorting.
+
+  C) REAL-TIME STATE SYNCHRONIZATION
+     There is only ONE source of truth at any moment (the Redis cache,
+     backed by PostgreSQL for durability). Every dispatcher's browser is
+     a "mirror" of that source of truth, kept in sync via Pub/Sub +
+     WebSockets, so no two dispatchers ever see conflicting information.
+
+
+================================================================================
+SECTION 2: COMPLETE FEATURE & MECHANICS MATRIX
+================================================================================
+
+2.1 UI PANEL BREAKDOWN
+------------------------
+
+--------------------------------------------------------------------------
+PANEL: PRIORITY QUEUE (IncidentQueue.jsx)
+--------------------------------------------------------------------------
+Purpose:
+  Displays all incidents currently awaiting or undergoing response,
+  sorted strictly by severity (highest first), then by timestamp as a
+  tiebreaker.
+
+Mechanics:
+  - Backed directly by the Redis Sorted Set (ZADD/ZRANGE).
+  - Each incident renders as a "card" showing: category icon, address,
+    severity badge (color-coded: red = critical, orange = high,
+    yellow = moderate, blue = low), elapsed time since intake, and
+    current lifecycle state.
+  - Cards are draggable ONLY as drop *targets* (responders are dragged
+    onto them, not the reverse).
+  - Real-time re-ordering: if a new critical incident arrives, the list
+    visually re-sorts without a page reload, because the underlying
+    Redis ZSET order is re-fetched and the React state array is replaced.
+
+--------------------------------------------------------------------------
+PANEL: COMMAND MAP (CommandMap.jsx)
+--------------------------------------------------------------------------
+Purpose:
+  A geographic (Leaflet.js) map showing every active incident as a pin
+  and every responder unit as a moving marker.
+
+Mechanics:
+  - Built on Leaflet (open-source mapping library) via the React-Leaflet
+    wrapper, which lets map layers be declared as React components.
+  - Incident markers are color-coded to match their severity badge.
+  - Responder markers use directional icons (ambulance, fire truck,
+    police car) and update position live as GPS telemetry updates arrive
+    over the socket connection.
+  - An optional heatmap layer (Leaflet.heat) can visualize incident
+    density across the city, useful for identifying "hot zones."
+  - Clicking a map pin opens a popup with incident details and a
+    "Dispatch Nearest Unit" quick-action button.
+
+--------------------------------------------------------------------------
+PANEL: AI LIVE SANDBOX
+--------------------------------------------------------------------------
+Purpose:
+  A live testing console where a dispatcher (or QA engineer) can type
+  raw incident text and immediately see how the NLP Classifier scores
+  and categorizes it, BEFORE it becomes a real queued incident.
+
+Mechanics:
+  - Text is sent to the NLP_MODEL_ENDPOINT (see Section 4).
+  - The model returns a JSON payload with { category, severity,
+    confidence, extracted_entities (e.g., location, hazard keywords) }.
+  - This panel is sandboxed: nothing typed here touches the live Redis
+    queue unless the dispatcher explicitly clicks "Submit as Real
+    Incident."
+
+--------------------------------------------------------------------------
+PANEL: ACTIVE FLEET & UNITS (ResponderPanel.jsx)
+--------------------------------------------------------------------------
+Purpose:
+  Shows every responder unit currently on shift, their live status
+  (Available, En Route, On Scene, Off Duty), and — critically — their
+  real-time calculated distance to the currently selected incident.
+
+Mechanics:
+  - Each unit card is a native HTML5 drag source (draggable="true").
+  - Distance-to-incident is recalculated on every render using the
+    Haversine Formula (fully explained in 2.4 below).
+  - Units are sorted nearest-first automatically once an incident is
+    selected/focused, giving the dispatcher an instant "who do I send"
+    answer without manual calculation.
+
+2.2 STATE MACHINE LIFECYCLE
+------------------------------
+Every incident moves through exactly five states, in strict linear order
+(no skipping, no going backward except via explicit dispatcher override):
+
+  PENDING
+    Incident has been classified and queued. No unit assigned yet.
+    Visual: Red/orange card in Priority Queue, pin flashing on map.
+
+  ASSIGNED
+    A responder has been drag-and-dropped onto the incident. The unit is
+    now reserved for this incident, though it hasn't started moving yet.
+    Visual: Card shows assigned unit's callsign, badge dims slightly.
+
+  EN_ROUTE
+    The unit has confirmed (via their field app or dispatcher toggle)
+    that they are actively traveling to the scene.
+    Visual: Map marker begins moving; ETA countdown appears.
+
+  ON_SCENE
+    The unit has arrived at the incident location.
+    Visual: Map marker "locks" to the incident pin; timer switches from
+    "ETA" to "time on scene."
+
+  RESOLVED
+    The incident has been handled and closed out.
+    Visual: Card fades out and is removed from the active Priority
+    Queue view (archived to PostgreSQL for reporting/audit).
+
+HOW A TRANSITION UPDATES THE SYSTEM (mechanical trace):
+  1. Dispatcher (or field unit) triggers a status change (button click or
+     drag-and-drop event).
+  2. Frontend immediately updates its local React state for a snappy,
+     "optimistic" UI response (the card visually updates before the
+     server confirms).
+  3. Frontend emits a Socket.io event, e.g. socket.emit("update_status",
+     { incidentId, newState }).
+  4. Backend receives the event, validates the transition is legal (you
+     cannot jump from PENDING directly to ON_SCENE, for example), then:
+       a. Updates the cached incident object in Redis.
+       b. Writes the change to PostgreSQL for permanent audit history.
+       c. Publishes the change via Redis Pub/Sub on a shared channel.
+  5. Every dispatcher's server-side Socket.io listener receives the
+     Pub/Sub message and re-emits it down to every connected browser.
+  6. All OTHER dispatchers' browsers receive this event and update their
+     own local state — meaning the change appears on every screen in the
+     building (or across the country) within milliseconds, even though
+     only one dispatcher initiated it.
+
+2.3 HTML5 DRAG-AND-DROP MECHANISM (FULL WALKTHROUGH)
+-------------------------------------------------------
+Native HTML5 Drag-and-Drop (not a third-party library) is used for
+assigning responders to incidents. Three browser events work together:
+
+  onDragStart (fires on the RESPONDER CARD being picked up)
+    - Attached to each unit card: draggable="true" onDragStart={...}
+    - When the dispatcher presses down and starts moving a unit card,
+      this event fires once. Its job is to "load" the drag payload —
+      typically the responder's unique ID — into the browser's internal
+      dataTransfer object:
+        e.dataTransfer.setData("responderId", unit.id)
+    - Think of this as writing a sticky note and attaching it invisibly
+      to the cursor: "I am carrying Unit 7."
+
+  onDragOver (fires continuously on the INCIDENT CARD being hovered)
+    - By default, web browsers assume you CANNOT drop something onto an
+      element — this is why you normally see the "no entry" / red circle
+      cursor. The browser is designed to block drops unless explicitly
+      told otherwise.
+    - To allow a drop, the incident card's onDragOver handler MUST call
+      e.preventDefault(). This single line of code tells the browser:
+      "This element is a valid drop zone, stop blocking the cursor."
+    - Without preventDefault(), the onDrop event below would NEVER fire,
+      no matter how carefully the user drops the card.
+
+  onDrop (fires once on the INCIDENT CARD when the mouse is released)
+    - Reads back the payload that was stored during onDragStart:
+        const responderId = e.dataTransfer.getData("responderId")
+    - Combines it with the incident's own ID (already known from the
+      component's props) to build the assignment request.
+    - Triggers the actual assignment function, which updates local
+      state, emits the Socket.io "dispatch_unit" event, and (as
+      described in 2.5 below) fires the Redis Pub/Sub dispatch pipeline.
+    - Also typically calls e.preventDefault() again here to stop the
+      browser from performing its own default drop behavior (like trying
+      to "open" the dragged data as a file/link).
+
+  SUMMARY OF THE THREE-EVENT HANDSHAKE:
+    onDragStart  -> "I am picking up Unit 7"          (on the source)
+    onDragOver   -> "Yes, you may drop here"           (on the target,
+                     repeated continuously while hovering)
+    onDrop       -> "Unit 7 has been dropped on         (on the target,
+                     Incident #42, assign them"          once)
+
+2.4 THE HAVERSINE PROXIMITY DISTANCE FORMULA (FULL EXPLANATION)
+-------------------------------------------------------------------
+PURPOSE:
+  To answer the question "how far is this responder unit from this
+  incident?" using only GPS latitude/longitude coordinates — NOT a
+  routing engine, just a straight-line ("great-circle") distance, which
+  is fast enough to compute for many units simultaneously in real time.
+
+WHY NOT SIMPLE PYTHAGOREAN DISTANCE?
+  The Earth is a sphere (approximately), not a flat plane. Latitude and
+  longitude degrees do not represent equal physical distances everywhere
+  on Earth (a degree of longitude near the poles covers far less ground
+  than a degree of longitude at the equator). Simple flat-plane distance
+  math would give meaningfully wrong answers, especially over the
+  distances relevant to city-wide dispatch. The Haversine formula
+  correctly accounts for the Earth's curvature.
+
+THE FORMULA:
+    a = sin²(Δφ/2) + cos(φ1) · cos(φ2) · sin²(Δλ/2)
+    c = 2 · atan2(√a, √(1−a))
+    d = R · c
+
+  Where:
+    φ1, φ2  = latitude of point 1 and point 2, in RADIANS
+    Δφ      = φ2 − φ1 (difference in latitude, in radians)
+    Δλ      = λ2 − λ1 (difference in longitude, in radians)
+    R       = Earth's radius (see below)
+    d       = the resulting straight-line distance
+
+  (This is mathematically equivalent to the commonly written form
+   d = 2r·arcsin(√a) — atan2 is simply used in code for better numerical
+   stability near antipodal points.)
+
+WHY EARTH RADIUS R = 6371 KM?
+  6371 km is the Earth's MEAN radius — an average that accounts for the
+  fact that the Earth is not a perfect sphere but an "oblate spheroid"
+  (slightly flattened at the poles, bulging at the equator). For
+  city-and-regional-scale dispatch (a few to a few hundred kilometers),
+  the error introduced by using the mean radius instead of a precise
+  location-dependent radius is negligible (a matter of meters), so 6371
+  km is the industry-standard constant used for this class of problem.
+
+HOW GPS COORDINATES ARE PARSED:
+  - Every incident carries a { lat, lng } pair captured at intake
+    (either from the caller's device GPS or manually pinned on the map).
+  - Every responder unit carries a live { lat, lng } pair updated by
+    their in-vehicle GPS device/app, pushed to the server periodically
+    over the socket connection.
+  - Both values arrive as standard decimal degrees (e.g., lat: 12.9141,
+    lng: 74.8560) and must be converted to RADIANS before use in the
+    trigonometric formula above, since JavaScript's Math.sin/Math.cos
+    functions operate on radians, not degrees:
+        radians = degrees × (π / 180)
+
+HOW IT'S CALCULATED IN REAL TIME INSIDE ResponderPanel.jsx:
+  1. The component receives the currently SELECTED incident's { lat,
+     lng } as a prop, and the full list of responder units (each with
+     their own live { lat, lng }) from shared application state.
+  2. A pure helper function, haversineDistance(coord1, coord2), is
+     called once per responder unit, every time the component
+     re-renders (e.g., when a new incident is selected, or when a unit's
+     GPS position updates over the socket).
+  3. This function is typically wrapped for performance so it does not
+     recalculate unnecessarily on unrelated re-renders (e.g., using
+     useMemo, recalculating only when the incident selection or the
+     units array actually changes).
+  4. The resulting distance (in kilometers, usually rounded to one
+     decimal place, e.g., "2.3 km away") is displayed directly on each
+     unit's card.
+  5. The full unit list is then sorted ascending by this distance value,
+     so the physically closest available unit always appears at the top
+     of the Active Fleet panel — giving the dispatcher an instant,
+     mathematically sound recommendation without needing any external
+     mapping/routing API call (which would be slower and could fail if
+     the third-party service is down).
+
+NOTE ON ACCURACY:
+  Haversine gives "as the crow flies" distance, not driving distance.
+  This is an intentional trade-off: it is instantaneous to compute for
+  many units at once and requires no external API call, making it ideal
+  for a fast first-pass recommendation. A future enhancement could layer
+  a real routing API (e.g., for actual road-network ETA) on top of the
+  Haversine pre-filtered shortlist, rather than running expensive routing
+  calculations for every single unit on every render.
+
+2.5 REDIS PUB/SUB INTEGRATION — WHAT HAPPENS WHEN THE DISPATCH TRIGGER FIRES
+---------------------------------------------------------------------------------
+Redis Pub/Sub (Publish/Subscribe) is the mechanism that lets one server
+process announce an event, and any number of OTHER processes (or, in a
+scaled multi-server deployment, other server instances) react to it
+instantly, without polling.
+
+Step-by-step, when a dispatcher completes the drag-and-drop assignment:
+
+  1. FRONTEND: onDrop fires. The browser emits a Socket.io event:
+       socket.emit("dispatch_unit", { incidentId, responderId })
+
+  2. BACKEND (Express + Socket.io server): The event listener for
+     "dispatch_unit" receives this payload.
+
+  3. VALIDATION: The server checks the unit is actually "Available" and
+     the incident is actually still "PENDING" (preventing double-booking
+     — see Section 7 for the race-condition deep dive).
+
+  4. CACHE UPDATE: The server updates the incident's state in Redis
+     (moves it from PENDING to ASSIGNED, attaches the responderId) using
+     a direct key update or a Redis transaction (MULTI/EXEC) to keep the
+     read-modify-write atomic.
+
+  5. DURABLE WRITE: The server writes the same change to PostgreSQL via
+     Prisma, ensuring the assignment survives even if Redis were to
+     restart (Redis here acts as a fast cache/queue, PostgreSQL as the
+     permanent system of record).
+
+  6. PUBLISH: The server calls:
+       redisPublisher.publish("dispatch_events", JSON.stringify({
+         type: "UNIT_ASSIGNED", incidentId, responderId, timestamp
+       }))
+     This broadcasts the event on a Redis channel. Crucially, this
+     happens independently of which specific dispatcher/browser
+     triggered the action — Redis doesn't know or care who is
+     "listening," it just fans the message out to every subscriber.
+
+  7. SUBSCRIBE (on every server instance, including the one that
+     published it): A Redis subscriber client, set up at server startup,
+     has a listener: redisSubscriber.on("message", (channel, message) =>
+     {...}). This fires the instant the publish happens.
+
+  8. RELAY TO BROWSERS: Inside that subscriber callback, the server calls
+       io.emit("incident_updated", parsedMessage)
+     which pushes the update down every open Socket.io connection —
+     i.e., to every dispatcher's browser tab currently open, anywhere.
+
+  9. FRONTEND (on ALL connected clients, including the original
+     dispatcher's other tabs): A socket.on("incident_updated", ...)
+     listener receives the payload and updates local React state,
+     causing the incident card to visually move to "ASSIGNED," the
+     responder card to show "En Route to Incident #42," and the map
+     marker to update — all without any manual refresh.
+
+  WHY THIS TWO-LAYER APPROACH (Socket.io AND Redis Pub/Sub) INSTEAD OF
+  JUST SOCKET.IO ALONE?
+    Socket.io alone works perfectly for a SINGLE server instance. But
+    real dispatch centers often run multiple server instances (for
+    reliability/load balancing) behind a load balancer. A dispatcher
+    connected to Server A would never see an update triggered by a
+    dispatcher connected to Server B if only Socket.io's in-memory event
+    system were used. Redis Pub/Sub solves this by acting as a shared
+    "message bus" that every server instance listens to, guaranteeing
+    system-wide consistency regardless of how many server instances are
+    running or which one a given dispatcher happens to be connected to.
+
+
+================================================================================
+SECTION 3: TECH STACK, DEPENDENCIES & JUSTIFICATION
+================================================================================
+
+3.1 FRONTEND DEPENDENCIES
+----------------------------
+
+  react
+    WHY: Component-based architecture is essential for a dashboard with
+    many independently-updating panels (queue, map, fleet). Its
+    virtual-DOM diffing keeps frequent real-time updates (new incidents,
+    moving map markers) fast without manual DOM manipulation.
+
+  react-dom
+    WHY: Required companion package to render React components into the
+    actual browser DOM.
+
+  lucide-react
+    WHY CHOSEN OVER FONT AWESOME: Lucide ships as individual tree-shaken
+    SVG icon components, meaning the final bundle only includes icons
+    actually imported and used (e.g., Ambulance, Siren, MapPin). Font
+    Awesome's traditional icon-font approach typically bundles the ENTIRE
+    font family regardless of usage, resulting in a significantly larger
+    download for end users — a meaningful concern for a dashboard that
+    needs to load fast on possibly low-bandwidth dispatch center
+    networks.
+
+  leaflet
+    WHY CHOSEN OVER GOOGLE MAPS / MAPBOX GL JS: Leaflet is open-source
+    and free with no API key billing risk or usage-based pricing tiers —
+    important for a government/public-safety context where unpredictable
+    per-request billing is undesirable. It is also lightweight (~40KB
+    core) and has first-class support for custom tile servers, meaning
+    the platform is not locked into any single commercial map provider.
+
+  react-leaflet
+    WHY: A thin, well-maintained React wrapper around Leaflet that lets
+    map layers, markers, and popups be declared as JSX components,
+    keeping the map's rendering logic consistent with the rest of the
+    React codebase rather than mixing imperative Leaflet API calls
+    directly into component code.
+
+  leaflet.heat
+    WHY: A lightweight plugin purpose-built for rendering canvas-based
+    heatmaps directly on top of a Leaflet map, used for the optional
+    incident-density visualization layer. Chosen over building custom
+    canvas heatmap logic from scratch because it is a well-tested,
+    widely-used, single-purpose library with no unnecessary overhead.
+
+  socket.io-client
+    WHY CHOSEN OVER BARE WEBSOCKETS (the native browser WebSocket API):
+    Bare WebSockets provide zero built-in reconnection logic — if a
+    dispatcher's WiFi blips for two seconds, a raw WebSocket connection
+    simply dies and requires the developer to hand-write reconnection,
+    exponential backoff, and message-queueing logic. Socket.io provides
+    all of this automatically, plus a "room" abstraction (useful for
+    future features like per-district dispatch channels), and it
+    gracefully falls back to HTTP long-polling in restrictive network
+    environments where raw WebSocket connections may be blocked by a
+    firewall — a realistic concern in some government network setups.
+
+  tailwindcss (utility-first styling)
+    WHY: Enables rapid, consistent styling of many small dashboard
+    components (badges, cards, panels) directly in markup, without
+    maintaining a large separate stylesheet, and keeps bundle size
+    predictable since unused utility classes are purged at build time.
+
+3.2 BACKEND DEPENDENCIES
+----------------------------
+
+  express
+    WHY: The de facto minimal, unopinionated Node.js web framework.
+    Chosen for its simplicity and enormous ecosystem of middleware,
+    appropriate for a backend whose primary job is routing REST requests
+    and hosting the Socket.io server, rather than needing a heavier
+    full-stack framework's opinions.
+
+  socket.io (server)
+    WHY: Server-side counterpart to socket.io-client; provides the room
+    management, automatic reconnection handling, and event-based
+    architecture described above, from the server side.
+
+  ioredis
+    WHY CHOSEN OVER THE STANDARD "redis" NPM PACKAGE: ioredis has
+    first-class, built-in support for Redis Cluster and Redis Sentinel
+    (high-availability configurations), which is important for a system
+    where Redis downtime means the ENTIRE live dispatch queue becomes
+    unavailable. ioredis also has a more ergonomic Promise-based API
+    out of the box and is widely regarded as more resilient for
+    production-grade, mission-critical use cases such as this one.
+
+  prisma (ORM) + @prisma/client
+    WHY CHOSEN OVER RAW SQL / OTHER ORMs (e.g., Sequelize, TypeORM):
+    Prisma provides fully type-safe, auto-generated database queries and
+    a declarative schema file that doubles as living documentation of
+    the data model. Its migration tooling is simpler and more
+    predictable than most alternatives, reducing the risk of schema
+    drift in a system where incident/audit data integrity is critical.
+
+  postgresql (via pg driver, used under Prisma)
+    WHY CHOSEN OVER NoSQL (e.g., MongoDB): Incident and responder
+    records are inherently RELATIONAL (an incident has one assigned
+    responder; a responder has a history of many incidents; a district
+    has many units) and benefit from strong ACID transaction guarantees
+    — critical for audit-proof emergency records that may later be
+    reviewed for compliance or legal purposes.
+
+  dotenv
+    WHY: Standard, minimal library for loading environment variables
+    from a local .env file during development, keeping secrets out of
+    source code.
+
+  cors
+    WHY: Required Express middleware to explicitly allow the frontend's
+    origin to make requests to the backend API, since they typically run
+    on different ports/domains in development and potentially different
+    subdomains in production.
+
+  jsonwebtoken (JWT) + bcrypt
+    WHY: Standard, battle-tested combination for dispatcher
+    authentication — bcrypt for one-way password hashing (never storing
+    plaintext passwords), JWT for stateless session tokens so the server
+    doesn't need to store session data for every logged-in dispatcher.
+
+3.3 AI / NLP LAYER
+----------------------
+  (NLP_MODEL_ENDPOINT — external or self-hosted classification service)
+    WHY EXTERNAL SERVICE OVER IN-BROWSER MODEL: Running a full NLP
+    classification model directly in the browser would require shipping
+    a large model file to every client and would be limited by client
+    device compute power. Delegating classification to a dedicated
+    backend/API endpoint keeps the frontend lightweight and allows the
+    classification model itself to be upgraded independently of the
+    client application.
+
+
+================================================================================
+SECTION 4: API KEYS, ENVIRONMENT VARIABLES & SECURITY
+================================================================================
+
+4.1 REQUIRED .env VARIABLES
+-------------------------------
+
+  DATABASE_URL
+    WHAT IT DOES: The full PostgreSQL connection string (protocol, user,
+    password, host, port, database name) used by Prisma to connect to
+    the permanent record-keeping database.
+    Example shape: postgresql://user:password@localhost:5432/dispatch_db
+
+  REDIS_URL
+    WHAT IT DOES: The connection string for the Redis instance used for
+    the live sorted incident queue, live cache, and Pub/Sub channel.
+    Example shape: redis://default:password@localhost:6379
+
+  PORT
+    WHAT IT DOES: The port number the Express + Socket.io server listens
+    on (e.g., 4000). Allows the port to be reconfigured per environment
+    (local dev vs. staging vs. production) without touching code.
+
+  NLP_MODEL_ENDPOINT
+    WHAT IT DOES: The URL of the NLP classification service that
+    receives raw incident text and returns { category, severity,
+    confidence }. Kept as an environment variable so the model/service
+    can be swapped or moved without a code deployment.
+
+  MAPBOX_TOKEN / LEAFLET_TILE_URL
+    WHAT IT DOES: The URL template (and, if using a commercial tile
+    provider, an access token) for the map tile imagery layer that
+    Leaflet renders as its base map. Kept configurable so the platform
+    is not hard-coded to one specific map tile provider.
+
+  JWT_SECRET
+    WHAT IT DOES: The private cryptographic secret used to sign and
+    verify dispatcher login session tokens. Must be a long, random,
+    unguessable string.
+
+4.2 SECURITY PRACTICES
+----------------------------
+
+  - SERVER-ONLY SECRETS: DATABASE_URL, REDIS_URL, JWT_SECRET, and any
+    paid NLP API key are NEVER sent to or embedded in frontend/client
+    code. They live exclusively in the backend's environment and are
+    accessed only via server-side process.env lookups. The browser only
+    ever talks to the backend, never directly to Redis, PostgreSQL, or
+    a paid third-party NLP provider.
+
+  - PUBLIC-SAFE VALUES ONLY ON THE CLIENT: Only values explicitly
+    required for frontend rendering (e.g., a public map tile URL, or a
+    Mapbox token specifically scoped/restricted to map-tile-serving
+    permissions only) are ever exposed to the browser, and even these are
+    domain-restricted at the provider level where possible.
+
+  - .env FILES ARE GIT-IGNORED: The actual .env file is never committed
+    to version control; only a .env.example template (with blank/dummy
+    values) is committed, documenting which variables are required.
+
+4.3 GRACEFUL FALLBACKS IF KEYS/CONNECTIONS FAIL
+----------------------------------------------------
+
+  - REDIS CONNECTION LOST: The backend detects the dropped connection
+    and the frontend UI displays a persistent "Live Sync Degraded"
+    banner. The system falls back to reading the last-known incident
+    list directly from PostgreSQL (slower, but functional), so
+    dispatchers are never left with a completely blank screen, though
+    real-time updates pause until Redis reconnects (ioredis's built-in
+    reconnection/retry strategy handles automatic recovery).
+
+  - NLP ENDPOINT UNREACHABLE: If the classification service times out or
+    errors, the incident is still queued, but is defaulted to a
+    conservative "UNCLASSIFIED - Manual Review Required" high-visibility
+    state, ensuring no incident silently disappears just because the AI
+    service is down. A dispatcher can manually assign severity in this
+    fallback case.
+
+  - MAP TILE PROVIDER FAILURE: If the primary tile URL fails to load,
+    the CommandMap component is configured to fall back to a secondary,
+    free public tile source (e.g., OpenStreetMap's standard tile
+    servers), so the map is never left completely blank.
+
+
+================================================================================
+SECTION 5: GRANULAR FOLDER STRUCTURE & COMPONENT DATA FLOW
+================================================================================
+
+5.1 COMPLETE DIRECTORY TREE
+--------------------------------
+
+emergency-dispatch-platform/
+│
+├── frontend/
+│   ├── public/
+│   │   └── index.html
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── App.jsx
+│   │   │   ├── IncidentQueue.jsx
+│   │   │   ├── ResponderPanel.jsx
+│   │   │   ├── CommandMap.jsx
+│   │   │   ├── AISandbox.jsx
+│   │   │   ├── IncidentCard.jsx
+│   │   │   └── ResponderCard.jsx
+│   │   ├── hooks/
+│   │   │   ├── useSocket.js
+│   │   │   └── useHaversine.js
+│   │   ├── utils/
+│   │   │   ├── haversine.js
+│   │   │   └── stateMachine.js
+│   │   ├── context/
+│   │   │   └── DispatchContext.jsx
+│   │   ├── styles/
+│   │   │   └── index.css
+│   │   └── main.jsx
+│   ├── package.json
+│   └── vite.config.js
+│
+├── backend/
+│   ├── src/
+│   │   ├── server.js
+│   │   ├── sockets/
+│   │   │   └── socketHandlers.js
+│   │   ├── redis/
+│   │   │   ├── redisClient.js
+│   │   │   ├── incidentQueue.js        (ZADD/ZRANGE logic)
+│   │   │   └── pubsub.js
+│   │   ├── routes/
+│   │   │   ├── incidents.routes.js
+│   │   │   ├── responders.routes.js
+│   │   │   └── auth.routes.js
+│   │   ├── controllers/
+│   │   │   ├── incidents.controller.js
+│   │   │   └── responders.controller.js
+│   │   ├── services/
+│   │   │   └── nlpClassifier.service.js
+│   │   ├── prisma/
+│   │   │   └── schema.prisma
+│   │   └── middleware/
+│   │       └── auth.middleware.js
+│   ├── package.json
+│   └── .env.example
+│
+└── README.md
+
+5.2 LINE-BY-LINE FUNCTION/PROP MAPPING FOR KEY COMPONENTS
+--------------------------------------------------------------
+
+--- App.jsx ---
+  ROLE: The root component. Establishes the single Socket.io connection
+  (via the useSocket hook) and holds the top-level shared state:
+  incidents (array), responders (array), and selectedIncidentId.
+
+  Key responsibilities:
+    - useEffect(() => { socket.on("incident_updated", handler) }, [])
+      Subscribes once, on mount, to all live incident change events.
+    - Passes `incidents` and `setSelectedIncidentId` down as props to
+      <IncidentQueue />.
+    - Passes `responders` and `selectedIncidentId` down as props to
+      <ResponderPanel />.
+    - Passes `incidents` and `responders` down as props to <CommandMap />.
+    - This "lift state up" pattern ensures all three panels are always
+      rendering from the exact same underlying data, so they can never
+      visually disagree with one another.
+
+--- IncidentQueue.jsx ---
+  PROPS RECEIVED: incidents (array, already pre-sorted server-side by
+  Redis ZRANGE), onSelectIncident (function), onDrop (function passed
+  down to each card for drag-and-drop targeting).
+
+  Key responsibilities:
+    - Maps over the incidents array, rendering one <IncidentCard /> per
+      incident.
+    - Each <IncidentCard /> receives onDragOver={handleDragOver} (which
+      calls e.preventDefault()) and onDrop={(e) =>
+      handleDrop(e, incident.id)}.
+    - Clicking a card calls onSelectIncident(incident.id), which updates
+      the shared selectedIncidentId state in App.jsx — this is what
+      causes ResponderPanel to recalculate Haversine distances relative
+      to THIS incident.
+
+--- ResponderPanel.jsx ---
+  PROPS RECEIVED: responders (array), selectedIncident (object, the
+  full incident data for whichever incident is currently selected,
+  including its { lat, lng }).
+
+  Key responsibilities:
+    - For each responder, computes:
+        const distance = haversineDistance(
+          { lat: responder.lat, lng: responder.lng },
+          { lat: selectedIncident.lat, lng: selectedIncident.lng }
+        )
+    - Sorts the responders array ascending by this computed distance
+      before rendering, so the nearest available unit renders first.
+    - Renders each unit as a <ResponderCard /> with draggable="true" and
+      onDragStart={(e) => e.dataTransfer.setData("responderId",
+      responder.id)}.
+    - Displays the live distance value (e.g., "2.3 km") directly on the
+      card, recalculated automatically whenever selectedIncident changes
+      or a responder's GPS position updates via the socket.
+
+--- CommandMap.jsx ---
+  PROPS RECEIVED: incidents (array), responders (array).
+
+  Key responsibilities:
+    - Renders a <MapContainer> (from react-leaflet) with a base
+      <TileLayer> pointed at LEAFLET_TILE_URL.
+    - Maps over `incidents`, rendering a <Marker> at each incident's
+      { lat, lng }, color-coded by severity, each with a <Popup>
+      showing incident details.
+    - Maps over `responders`, rendering a <Marker> at each responder's
+      live { lat, lng } with a directional vehicle icon.
+    - Markers automatically re-position on re-render whenever the
+      underlying incidents/responders props change (i.e., whenever new
+      socket data arrives), without requiring a manual map refresh.
+
+5.3 EXPLICIT DATA FLOW TRACE: INCOMING INCIDENT TO DRAG TARGET
+--------------------------------------------------------------------
+  1. Socket Listener (App.jsx, useEffect):
+       socket.on("incident_updated", (payload) => {
+         setIncidents(prev => mergeOrAppend(prev, payload))
+       })
+     A new incident arrives over the WebSocket connection as a JSON
+     payload.
+
+  2. State Array (App.jsx):
+       The `incidents` state array (React useState) is updated
+       immutably — a new array is created containing the new incident,
+       triggering React's re-render cycle for any component subscribed
+       to this state.
+
+  3. Map Markers (CommandMap.jsx):
+       Because `incidents` is passed as a prop to CommandMap, React
+       automatically re-renders CommandMap's list of <Marker>
+       components, causing a brand-new pin to visually appear at the
+       incident's GPS coordinates — no manual DOM manipulation required.
+
+  4. Drop Target (IncidentQueue.jsx / IncidentCard.jsx):
+       Simultaneously, the same updated `incidents` array is passed to
+       IncidentQueue, which renders a new <IncidentCard>. This card is
+       automatically wired with onDragOver/onDrop handlers the moment it
+       mounts, meaning it is INSTANTLY a valid drop target for any
+       responder card being dragged — no extra setup step is needed
+       because the drag-and-drop event handlers are declared as part of
+       the card's own JSX, not attached imperatively after the fact.
+
+
+================================================================================
+SECTION 6: SCHEMAS & DATA STRUCTURES
+================================================================================
+
+6.1 INCIDENT DATA SCHEMA
+----------------------------
+{
+  "id": "inc_8f3a2b1c",
+  "text": "Man collapsed, not breathing, corner of 5th and Main",
+  "category": "MEDICAL",
+  "severity": 9,
+  "state": "PENDING",
+  "location": {
+    "lat": 12.9141,
+    "lng": 74.8560,
+    "address": "5th & Main St, Mangaluru"
+  },
+  "assignedResponderId": null,
+  "createdAt": "2026-07-31T08:12:44.000Z",
+  "updatedAt": "2026-07-31T08:12:44.000Z",
+  "resolvedAt": null
+}
+
+6.2 RESPONDER DATA SCHEMA
+------------------------------
+{
+  "id": "unit_amb_04",
+  "callsign": "Ambulance 4",
+  "type": "MEDICAL",
+  "status": "AVAILABLE",
+  "location": {
+    "lat": 12.9200,
+    "lng": 74.8500
+  },
+  "currentIncidentId": null,
+  "lastPing": "2026-07-31T08:13:01.000Z"
+}
+
+6.3 SOCKET EVENT PAYLOADS
+------------------------------
+
+  EVENT: "new_incident" (server -> all clients)
+  {
+    "type": "NEW_INCIDENT",
+    "incident": { /* full Incident Data Schema object, see 6.1 */ }
+  }
+
+  EVENT: "dispatch_unit" (client -> server)
+  {
+    "incidentId": "inc_8f3a2b1c",
+    "responderId": "unit_amb_04"
+  }
+
+  EVENT: "incident_updated" (server -> all clients, via Redis Pub/Sub relay)
+  {
+    "type": "UNIT_ASSIGNED",
+    "incidentId": "inc_8f3a2b1c",
+    "responderId": "unit_amb_04",
+    "newState": "ASSIGNED",
+    "timestamp": "2026-07-31T08:13:10.000Z"
+  }
+
+  EVENT: "responder_position_update" (server -> all clients)
+  {
+    "responderId": "unit_amb_04",
+    "location": { "lat": 12.9188, "lng": 74.8512 },
+    "timestamp": "2026-07-31T08:13:25.000Z"
+  }
+
+
+================================================================================
+SECTION 7: COMPREHENSIVE VIVA / EVALUATOR PREPARATION
+================================================================================
+
+Q1. Why use Redis ZADD Sorted Sets instead of a standard SQL "ORDER BY"
+    query for the priority queue?
+A1. A Redis Sorted Set stores members with an associated numeric score
+    (severity) using a skip-list data structure internally, which keeps
+    all members continuously sorted at insertion time. Retrieving the
+    top N highest-priority incidents (ZREVRANGE) is an O(log N + M)
+    operation performed entirely in memory. A SQL "ORDER BY severity
+    DESC" query, by contrast, must read rows (potentially from disk, or
+    at best from a buffer cache), and — without a suitably maintained
+    index — perform an O(N log N) sort on every single query. Even with
+    an index, disk-backed databases carry I/O latency that an in-memory
+    structure simply does not have. For a system whose entire value
+    proposition is sub-second responsiveness, Redis's in-memory O(log N)
+    insertion and near-instant sorted retrieval is architecturally
+    superior for this specific "always give me the current top
+    priority" access pattern. PostgreSQL is still used, deliberately, as
+    the durable system of record — it's just not used for the hot,
+    latency-critical read path.
+
+Q2. Why calculate Haversine distance on the client (browser) instead of
+    the server?
+A2. Two valid engineering justifications: First, distance-to-selected-
+    incident is a PURELY PRESENTATIONAL, per-dispatcher concern — each
+    dispatcher may have a different incident selected/focused at any
+    given moment, so calculating it centrally on the server for every
+    possible incident/responder pair would be wasted computation for
+    combinations no one is currently viewing. Second, offloading this
+    lightweight, stateless math (a handful of trigonometric operations)
+    to the client reduces server CPU load, letting the server's compute
+    budget stay focused on socket connection management, Redis
+    operations, and database writes — the things that genuinely must be
+    centralized. That said, this is a deliberate trade-off: a system
+    that needed a single authoritative "nearest unit" ranking used for
+    automated dispatch decisions (rather than just human-facing display)
+    would likely calculate this server-side instead, to guarantee every
+    dispatcher sees an identical ranking.
+
+Q3. How does HTML5 Drag & Drop prevent the "drop blocked" red cursor
+    from appearing?
+A3. Browsers assume, by default, that no element is a valid drop target.
+    The red "no entry" cursor is the browser's default rejection
+    behavior during a drag operation. To override this, the intended
+    drop-zone element's onDragOver handler must explicitly call
+    event.preventDefault(). This call happens continuously, dozens of
+    times per second, for as long as the dragged item hovers over that
+    element, and it is precisely what flips the cursor from "blocked" to
+    "allowed" and enables the subsequent onDrop event to actually fire
+    when the mouse button is released.
+
+Q4. How does the system handle a lost WebSocket connection?
+A4. Socket.io, on the client, automatically detects a dropped connection
+    and enters a reconnection loop with exponential backoff, meaning it
+    doesn't hammer the server with reconnect attempts but progressively
+    spaces them out. While disconnected, the frontend can display a
+    "Reconnecting..." indicator so dispatchers are aware their view may
+    be stale. Because Redis remains the authoritative cache and
+    PostgreSQL the durable store, no data is lost during the
+    disconnection — once the socket reconnects, the client re-fetches
+    the current full incident/responder state via a REST endpoint to
+    "catch up" on anything it missed while disconnected, then resumes
+    normal real-time event listening.
+
+Q5. How does Leaflet handle map re-renders without freezing the UI
+    thread?
+A5. Leaflet renders its map tiles and vector layers (markers, popups)
+    using efficient DOM/canvas layer management rather than redrawing
+    the entire map from scratch on every update. React-Leaflet further
+    optimizes this by only re-rendering the specific <Marker> components
+    whose underlying data (position, icon) has actually changed, thanks
+    to React's virtual DOM diffing — a marker whose position hasn't
+    changed since the last render is not touched at all. Additionally,
+    expensive computations (like Haversine sorting) are kept OFF the
+    map-rendering component itself and are memoized (useMemo) so they
+    only recompute when their actual dependencies change, preventing
+    unnecessary re-render cascades that could otherwise cause visible
+    jank on lower-powered dispatch center hardware.
+
+Q6. How is a race condition avoided when two dispatchers try to assign
+    the same responder unit to two different incidents at nearly the
+    same instant?
+A6. This is handled with an atomic, server-side check-and-set operation.
+    When a "dispatch_unit" event is received, the server does not
+    blindly trust the client's assumption that the unit is available —
+    it performs an atomic Redis operation (for example, a WATCH/MULTI/
+    EXEC transaction, or a Lua script executed atomically inside Redis)
+    that reads the responder's current status and, in the SAME atomic
+    step, only proceeds with the assignment if the status is still
+    "AVAILABLE." If Dispatcher A's assignment executes first, the
+    responder's status flips to "ASSIGNED" atomically; when Dispatcher
+    B's slightly-later request executes, the atomic check fails (status
+    is no longer "AVAILABLE"), the assignment is rejected, and
+    Dispatcher B's client immediately receives an "already assigned"
+    error, prompting the UI to refresh and show the responder as
+    unavailable. This "optimistic client, pessimistic-atomic server"
+    pattern guarantees only one of the two competing requests can ever
+    win, regardless of network timing.
+
+Q7. Why is PostgreSQL used at all if Redis is fast enough for
+    everything?
+A7. Redis is an in-memory store — while extremely fast, it is not
+    designed as the sole long-term source of truth; data can be lost on
+    a crash unless carefully configured for persistence, and it is not
+    well-suited for complex relational queries (e.g., "show me every
+    incident a specific responder handled in the last 90 days for a
+    performance review"). PostgreSQL provides ACID-compliant durability
+    and rich relational querying/reporting capability. The architecture
+    therefore uses Redis as a fast, ephemeral "working cache" for
+    anything requiring real-time speed, and PostgreSQL as the permanent,
+    audit-safe historical record — each tool is used for what it is
+    architecturally best at.
+
+Q8. Why Socket.io instead of Server-Sent Events (SSE) or plain HTTP
+    polling?
+A8. HTTP polling requires the client to repeatedly ask "anything new?"
+    on a timer, which either introduces latency (long intervals) or
+    wastes bandwidth/server resources (short intervals), and it cannot
+    truly react the instant something happens. SSE is one-directional
+    (server-to-client only), which would not support this platform's
+    need for the CLIENT to also send real-time events (like a
+    drag-and-drop dispatch action) over the same persistent connection.
+    Socket.io provides true bidirectional, event-driven communication
+    over a single long-lived connection, with automatic reconnection
+    and fallback transport handling built in, making it the most
+    complete fit for this platform's two-way real-time requirements.
+
+Q9. What happens if the NLP classification is wrong (e.g., it
+    under-scores a genuinely critical incident)?
+A9. The severity score is a starting recommendation, not an
+    unchangeable final decision — the dispatcher retains full manual
+    override capability and can directly re-assign an incident's
+    severity level from the Priority Queue panel at any time, which
+    immediately re-runs the Redis ZADD update with the new score,
+    instantly re-sorting the queue. This "AI-assisted, human-in-the-
+    loop" design is a deliberate safety choice: the system is built to
+    accelerate triage, not to remove human judgment from
+    life-or-death classification decisions.
+
+Q10. Why store both `lat/lng` on the incident AND continuously update
+     `lat/lng` on the responder, rather than just storing a static
+     address string?
+A10. Numeric coordinates are required for any mathematical distance
+     calculation (Haversine) and for placing precise map markers;
+     a plain address string cannot be used directly in trigonometric
+     formulas or plotted on a Leaflet map without first being
+     "geocoded" into coordinates anyway. Additionally, responder units
+     are mobile — their location must update continuously in real time
+     as they physically move, which only makes sense as live numeric
+     coordinates pushed periodically over the socket connection, not a
+     static, one-time address.
+
+Q11. How does the system prevent an incident from being displayed
+     twice, or a state update from being applied out of order, given
+     that events arrive asynchronously over the network?
+A11. Every incident carries a stable, unique `id`. When the frontend
+     receives an "incident_updated" event, it merges the change into
+     its local state array by matching on this `id` (replacing the
+     existing entry rather than appending a duplicate) instead of
+     blindly pushing every incoming event onto the array. Additionally,
+     every event carries a server-generated `timestamp`/`updatedAt`
+     field; the client can compare this against the locally-held
+     version and safely discard any event that is older than what it
+     already has, protecting against out-of-order delivery over an
+     unreliable network.
+
+Q12. Why is the drag-and-drop implemented with the native HTML5 API
+     instead of a third-party library like react-dnd or dnd-kit?
+A12. For this platform's actual requirement — dragging a simple
+     responder card and dropping it onto an incident card, a fairly
+     straightforward one-directional interaction — the native HTML5
+     Drag and Drop API is fully sufficient and requires zero additional
+     dependencies, keeping the bundle smaller. Third-party drag-and-drop
+     libraries earn their complexity budget when a project needs more
+     advanced behavior (e.g., touch-device drag support, sortable lists,
+     nested drop zones, drag previews with custom rendering). Since this
+     platform's dispatch interaction is simple and desktop/mouse-driven
+     (a command center environment), the native browser API was judged
+     the leaner, more maintainable choice — with a note that a future
+     mobile/tablet-focused field-unit app would likely need to
+     reconsider this, since native HTML5 Drag and Drop has notoriously
+     poor touchscreen support.
+
+Q13. How would this system behave under significantly higher load (e.g.,
+     a city-wide mass-casualty event generating hundreds of incidents in
+     minutes)?
+A13. The sorted-set approach in Redis is specifically well-suited to
+     this scenario, since insertion and retrieval remain fast
+     (logarithmic) regardless of how many incidents are queued at once
+     — the Priority Queue panel will still correctly surface the single
+     most critical incident first, even amid a large, rapidly growing
+     backlog. The Socket.io/Redis Pub/Sub broadcast pattern also scales
+     horizontally: additional backend server instances can be added
+     behind a load balancer, all subscribing to the same Redis Pub/Sub
+     channel, ensuring every dispatcher stays synchronized regardless of
+     which specific server instance their browser happens to be
+     connected to.
+
+Q14. What is the actual difference between the Redis cache being
+     updated and the PostgreSQL database being updated during a state
+     transition — why do both?
+A14. The Redis update is what makes the change appear INSTANTLY across
+     every connected dispatcher's screen — it is the fast, "live"
+     representation of current system state. The PostgreSQL write is
+     what makes the change PERMANENT and queryable for reporting,
+     compliance, and historical audit purposes long after the incident
+     is closed and removed from the live queue. If only Redis were
+     updated, a Redis restart or eviction could silently lose incident
+     history. If only PostgreSQL were updated, every single status
+     change would incur disk-write latency before being visible to
+     other dispatchers, violating the platform's core low-latency
+     philosophy. Using both, in the specific order described in Section
+     2.5, gives the system both speed and durability.
+
+================================================================================
+END OF DOCUMENT
+================================================================================

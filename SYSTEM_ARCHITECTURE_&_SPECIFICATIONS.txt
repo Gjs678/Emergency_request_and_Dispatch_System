@@ -1,0 +1,460 @@
+================================================================================
+EMERGENCY COMMAND CENTER DISPATCH PLATFORM
+SYSTEM ARCHITECTURE & SPECIFICATIONS
+Prepared by: Principal System Architect
+================================================================================
+
+------------------------------------------------------------------------------
+1. EXECUTIVE OVERVIEW
+------------------------------------------------------------------------------
+PURPOSE:
+A real-time emergency dispatch platform that ingests incoming incident reports,
+prioritizes them intelligently, and coordinates the nearest available
+responders (police, fire, medical, rescue) to the scene with minimal latency.
+
+PROBLEM SOLVED:
+Traditional dispatch systems rely on manual triage and radio calls, causing
+delays in high-severity situations. This platform automates:
+  - Priority scoring of incoming incidents (via NLP analysis of report text)
+  - Ordering of the dispatch queue (via Redis Sorted Sets, O(log N) insert)
+  - Live visualization of incidents and responders on an interactive map
+  - Instant, bidirectional updates to every connected dispatcher screen
+  - Nearest-responder computation using great-circle distance (Haversine)
+
+REAL-TIME DISPATCH WORKFLOW:
+  1. Incident reported (via intake form or external feed) -> raw text + geo
+     coordinates captured.
+  2. NLP Priority Engine scores urgency (CRITICAL / HIGH / MEDIUM / LOW)
+     based on keyword severity, sentiment, and casualty/hazard indicators.
+  3. Incident pushed into Redis Sorted Set queue, scored by
+     (priority_weight, timestamp) so the queue self-orders.
+  4. Redis Pub/Sub broadcasts an "incident:new" event to all subscribed
+     server instances.
+  5. Server relays event over WebSocket to every connected dispatcher client.
+  6. CommandMap renders incident marker; IncidentQueue lists it in priority
+     order automatically (no client-side re-sort needed - queue is
+     pre-sorted server-side).
+  7. Dispatcher drags a Responder card from ResponderPanel onto the incident
+     (or map marker) OR system suggests nearest responder via Haversine
+     distance ranking.
+  8. Incident status transitions PENDING -> ASSIGNED; event re-broadcast.
+  9. Responder device (simulated/real) updates status EN_ROUTE -> ON_SCENE ->
+     RESOLVED; each transition is Pub/Sub-broadcast and reflected live on
+     every dispatcher's map and queue with zero page refresh.
+
+------------------------------------------------------------------------------
+2. FULL FEATURE MATRIX
+------------------------------------------------------------------------------
+
+A) NLP PRIORITY ENGINE
+   - Input: free-text incident description.
+   - Process: tokenizes text, matches against weighted keyword dictionaries
+     (e.g., "fire", "unconscious", "weapon" = high weight; "noise complaint"
+     = low weight), applies severity scoring function.
+   - Output: priority label (CRITICAL=4, HIGH=3, MEDIUM=2, LOW=1) and a
+     numeric confidence score.
+   - This numeric weight becomes the primary sort key for the Redis queue.
+
+B) REDIS ZADD SORTED SET QUEUE
+   - Command pattern: ZADD incident_queue <score> <incident_id>
+   - Score formula: score = (priority_weight * 1e13) - unix_timestamp_ms
+     (subtracting timestamp ensures that within the same priority tier,
+     older incidents surface first - FIFO within priority band).
+   - Retrieval: ZREVRANGE incident_queue 0 -1 WITHSCORES returns the queue
+     already sorted highest-priority-first, no application-side sort needed.
+   - Removal on resolution: ZREM incident_queue <incident_id>.
+
+C) REAL-TIME WEBSOCKETS (Socket.io)
+   - Persistent bidirectional connection between each dispatcher browser tab
+     and the Node.js server.
+   - Channels/events: incident:new, incident:updated, incident:resolved,
+     responder:location, responder:status.
+   - Guarantees sub-second propagation vs. polling-based delay.
+
+D) LEAFLET INTERACTIVE MAP
+   - Tile layer: OpenStreetMap (no vendor lock-in, no API key required).
+   - Incident markers: color-coded by priority (red=CRITICAL, orange=HIGH,
+     yellow=MEDIUM, blue=LOW), custom DivIcon with pulsing CSS animation for
+     unassigned CRITICAL incidents.
+   - Responder markers: icon by unit type (police/fire/medical/rescue),
+     rotates/moves as location updates stream in.
+   - Click-to-inspect popups showing incident metadata and assign controls.
+
+E) DRAG-AND-DROP RESPONDER FLEET PANEL
+   - Built on native HTML5 Drag and Drop API (draggable="true",
+     ondragstart, ondragover, ondrop) - no external DnD library dependency.
+   - ResponderPanel lists all units with status (AVAILABLE, ON_DUTY,
+     OFF_DUTY, EN_ROUTE, ON_SCENE) and live map coordinates.
+   - Dragging a responder card onto an IncidentQueue row or a map marker
+     fires an assignment handler that emits a WebSocket "assign" event.
+   - ondragover explicitly calls event.preventDefault() on the valid drop
+     target - this is the mechanism that "un-blocks" the drop (browsers
+     block drops by default unless dragover is intercepted).
+
+F) REDIS PUB/SUB EVENTS
+   - Decouples the WebSocket-emitting server process from the process(es)
+     that mutate state (e.g., a background worker or a horizontally scaled
+     API node).
+   - Channels: incidents:channel, responders:channel.
+   - Any node can PUBLISH; all subscribed Node.js server instances receive
+     the message and re-emit it to their locally connected Socket.io
+     clients - this is what allows the platform to scale horizontally
+     while keeping every dispatcher in sync.
+
+G) STATUS LIFECYCLE STATE MACHINE
+   PENDING -> ASSIGNED -> EN_ROUTE -> ON_SCENE -> RESOLVED
+   - PENDING: incident created, no responder attached, sits in Sorted Set.
+   - ASSIGNED: a responder has been drag-dropped or auto-matched; responder
+     status flips AVAILABLE -> ASSIGNED simultaneously.
+   - EN_ROUTE: responder has acknowledged and begun transit (device/manual
+     update); ETA recalculated via Haversine distance / avg speed.
+   - ON_SCENE: responder GPS proximity (or manual confirm) triggers this.
+   - RESOLVED: incident closed; ZREM removes it from the active queue and
+     archives it; responder status reverts to AVAILABLE.
+   - Transitions are strictly forward-only in the base model; a
+     cancel/reopen path is a separate exception branch (ASSIGNED -> PENDING)
+     used only if a responder is unassigned.
+
+H) HAVERSINE PROXIMITY DISTANCE FORMULA (new)
+   - Purpose: compute great-circle distance between an incident and every
+     AVAILABLE responder to rank/recommend the nearest unit, accounting for
+     Earth's curvature (flat Euclidean distance is inaccurate at city/region
+     scale).
+   - Equation:
+       a = sin²(Δφ/2) + cos(φ1) · cos(φ2) · sin²(Δλ/2)
+       c = 2 · atan2( √a, √(1−a) )
+       d = R · c
+     where:
+       φ1, φ2 = latitude of point 1 and point 2, in radians
+       Δφ     = φ2 − φ1
+       Δλ     = λ2 − λ1 (difference in longitude, in radians)
+       R      = Earth's mean radius (6371 km)
+       d      = resulting distance
+   - Implementation note: all incident/responder lat-lng pairs are converted
+     from degrees to radians before evaluation. Result sorted ascending to
+     produce a "Top 3 Nearest Responders" suggestion list per incident.
+
+------------------------------------------------------------------------------
+3. DEPENDENCIES & TECH STACK
+------------------------------------------------------------------------------
+FRONTEND
+  react                 - Component-driven UI; matches the need for many
+                           independently-updating live regions (map, queue,
+                           panel) without manual DOM diffing.
+  react-dom              - Required render target for React in browser.
+  react-leaflet           - Declarative React bindings for Leaflet; avoids
+                           imperative map-instance management inside React's
+                           lifecycle, reducing memory-leak risk on re-renders.
+  leaflet                - Lightweight (~40KB gzip), open-source mapping
+                           library. Chosen over Google Maps JS API to avoid
+                           API key billing/quota dependency for a
+                           mission-critical tool.
+  leaflet.heat            - Adds heatmap layer for incident density
+                           visualization; chosen for native Leaflet
+                           compatibility over rebuilding heatmap logic
+                           manually with canvas.
+  socket.io-client        - Client-side WebSocket abstraction with automatic
+                           reconnection/fallback to long-polling; chosen over
+                           raw WebSocket API for reliability on flaky
+                           dispatcher-network connections.
+  lucide-react            - Icon set; tree-shakeable SVG icons chosen over
+                           icon fonts (Font Awesome) for smaller bundle size
+                           and crisper rendering at small sizes.
+  tailwindcss             - Utility-first CSS; chosen for rapid, consistent
+                           styling of dense operational UI without
+                           maintaining separate stylesheet files.
+
+BACKEND
+  express                 - Minimal, unopinionated Node.js HTTP framework for
+                           REST endpoints (incident intake, auth, history).
+  socket.io                - Server-side WebSocket engine paired with the
+                           client library above; handles namespace/room
+                           management for multi-dispatcher broadcast.
+  redis (ioredis or node-redis) - Client for Redis; ioredis preferred for
+                           built-in cluster/sentinel support if scaled.
+  cors                    - Enables cross-origin requests from the dispatcher
+                           frontend during development.
+  dotenv                  - Loads environment variables from .env into
+                           process.env without hardcoding secrets.
+  nanoid / uuid            - Generates collision-resistant incident/responder
+                           IDs; chosen over auto-increment DB IDs so IDs are
+                           safe to generate client-side before DB round-trip.
+
+WHY REDIS OVER A TRADITIONAL RELATIONAL STORE FOR THE QUEUE:
+  Redis Sorted Sets give O(log N) insertion and O(log N + M) range retrieval
+  with results already ordered - a relational DB would require an
+  ORDER BY query on every poll, plus lacks Redis's sub-millisecond in-memory
+  latency and native Pub/Sub, which the dispatch queue's real-time nature
+  demands.
+
+------------------------------------------------------------------------------
+4. API KEYS & ENVIRONMENT VARIABLES
+------------------------------------------------------------------------------
+  PORT                    - Port the Express/Socket.io server binds to.
+                           Default fallback: 4000 if unset.
+
+  REDIS_URL                - Connection string (redis://host:port) for the
+                           Redis instance. Security: never committed to
+                           source; loaded via dotenv from .env (.env is
+                           .gitignore'd). Fallback: if unset, server attempts
+                           localhost:6379 and logs a warning; if that also
+                           fails, the app degrades to an in-memory array-based
+                           queue (loses persistence and Pub/Sub fan-out, but
+                           stays functional for local demo/dev).
+
+  CLIENT_ORIGIN             - Allowed CORS origin for the frontend (e.g.
+                           http://localhost:5173). Prevents unauthorized
+                           cross-origin WebSocket handshakes in production.
+
+  MAP_TILE_URL (optional)   - Overrides default OpenStreetMap tile endpoint if
+                           an org needs a private/paid tile provider.
+                           Fallback: public OSM tile server, no key required.
+
+  JWT_SECRET (if auth enabled) - Signs dispatcher session tokens. Must be a
+                           high-entropy random string, stored only in
+                           environment/secrets manager, never in code.
+                           No safe fallback - auth-enabled routes must fail
+                           closed (reject) if this is missing.
+
+  NOTE: No third-party paid mapping/NLP API key is required in the base
+  build - the NLP engine uses local keyword/weight scoring rather than an
+  external LLM API, and Leaflet/OSM requires no key - this was an explicit
+  design choice to keep the platform operable with zero external billing
+  dependencies during an actual emergency (avoids an outage if a paid API
+  goes down or quota is exhausted).
+
+------------------------------------------------------------------------------
+5. COMPLETE FOLDER STRUCTURE
+------------------------------------------------------------------------------
+emergency-dispatch-platform/
+├── server/
+│   ├── index.js                 - Express + Socket.io bootstrap; wires HTTP
+│   │                              routes, WebSocket server, and Redis
+│   │                              Pub/Sub subscriber startup.
+│   ├── redis/
+│   │   ├── client.js             - Redis connection instance (ioredis).
+│   │   ├── queue.js               - ZADD/ZREM/ZREVRANGE wrapper functions for
+│   │   │                          the incident_queue sorted set.
+│   │   └── pubsub.js               - publish()/subscribe() helpers for
+│   │                              incidents:channel and responders:channel.
+│   ├── nlp/
+│   │   └── priorityEngine.js        - Keyword/weight scoring function that
+│   │                              returns {priority, score} from raw text.
+│   ├── utils/
+│   │   └── haversine.js            - Pure function: haversineDistance(lat1,
+│   │                              lon1, lat2, lon2) -> distance in km.
+│   ├── routes/
+│   │   ├── incidents.js            - REST endpoints: POST /incidents
+│   │   │                          (create), GET /incidents (queue snapshot),
+│   │   │                          PATCH /incidents/:id (status change).
+│   │   └── responders.js            - REST endpoints for responder CRUD and
+│   │                              location updates.
+│   └── sockets/
+│       └── handlers.js              - Registers Socket.io event listeners,
+│                                    bridges Pub/Sub messages to emitted
+│                                    client events.
+├── client/
+│   ├── src/
+│   │   ├── App.jsx                  - Root component. Owns the Socket.io
+│   │   │                          connection, holds top-level state
+│   │   │                          (incidents[], responders[]), and passes
+│   │   │                          data + handlers down as props. Listens for
+│   │   │                          incident:new / responder:status events and
+│   │   │                          updates state, which cascades re-renders
+│   │   │                          to IncidentQueue and CommandMap.
+│   │   ├── components/
+│   │   │   ├── IncidentQueue.jsx     - Renders the pre-sorted incident list
+│   │   │   │                      received from App.jsx. Emits "select
+│   │   │   │                      incident" and "assign" events upward via
+│   │   │   │                      callback props; is a drop target for
+│   │   │   │                      responder drag events.
+│   │   │   ├── ResponderPanel.jsx     - Lists responder units with status
+│   │   │   │                      badges. Each card is draggable=true and
+│   │   │   │                      carries the responder ID in
+│   │   │   │                      dataTransfer on dragstart.
+│   │   │   └── CommandMap.jsx         - Wraps react-leaflet MapContainer.
+│   │   │                          Renders incident + responder markers from
+│   │   │                          props, recalculates Haversine-based
+│   │   │                          nearest-responder suggestions when a new
+│   │   │                          incident marker is selected, and is also a
+│   │   │                          valid drop target for direct
+│   │   │                          marker-to-marker assignment.
+│   │   └── main.jsx                  - Vite/React entry point.
+│   └── package.json
+├── .env                          - Local secrets (gitignored).
+├── .env.example                   - Documents required variable names
+│                                  without values.
+└── package.json
+
+DATA FLOW SUMMARY (App.jsx as hub-and-spoke):
+  Server WebSocket event -> App.jsx state update -> re-render props flow to
+  IncidentQueue.jsx (list view) AND CommandMap.jsx (spatial view)
+  simultaneously, guaranteeing both views are always in sync from one source
+  of truth. ResponderPanel.jsx drag events bubble an onAssign(responderId,
+  incidentId) callback up to App.jsx, which emits the WebSocket "assign"
+  event rather than mutating local state directly - state changes only ever
+  happen in response to a confirmed server event, preventing UI/server
+  desync.
+
+------------------------------------------------------------------------------
+6. DATA STRUCTURES & SCHEMAS
+------------------------------------------------------------------------------
+
+INCIDENT OBJECT:
+{
+  "id": "inc_8f3a1c",
+  "description": "Structure fire reported, occupants trapped",
+  "priority": "CRITICAL",
+  "priorityScore": 4,
+  "status": "PENDING",
+  "location": { "lat": 12.9141, "lng": 74.8560 },
+  "reportedAt": "2026-07-31T09:12:44.000Z",
+  "assignedResponderId": null,
+  "eta": null
+}
+
+RESPONDER OBJECT:
+{
+  "id": "res_22b9",
+  "callsign": "ENGINE-7",
+  "type": "FIRE",
+  "status": "AVAILABLE",
+  "location": { "lat": 12.9180, "lng": 74.8490 },
+  "lastUpdated": "2026-07-31T09:12:40.000Z"
+}
+
+SOCKET.IO PAYLOAD - incident:new:
+{
+  "event": "incident:new",
+  "data": { /* full Incident object as above */ }
+}
+
+SOCKET.IO PAYLOAD - incident:updated (status transition):
+{
+  "event": "incident:updated",
+  "data": {
+    "id": "inc_8f3a1c",
+    "status": "ASSIGNED",
+    "assignedResponderId": "res_22b9",
+    "eta": "00:04:12"
+  }
+}
+
+SOCKET.IO PAYLOAD - responder:location:
+{
+  "event": "responder:location",
+  "data": {
+    "id": "res_22b9",
+    "location": { "lat": 12.9165, "lng": 74.8520 }
+  }
+}
+
+REDIS SORTED SET ENTRY (conceptual):
+  key: "incident_queue"
+  member: "inc_8f3a1c"
+  score: 39999999996587.0  (priority_weight * 1e13 - timestamp_ms)
+
+------------------------------------------------------------------------------
+7. COMPREHENSIVE EVALUATOR Q&A
+------------------------------------------------------------------------------
+
+Q1: Why Redis ZADD/Sorted Sets over a PostgreSQL ORDER BY query for the
+    dispatch queue?
+A1: Sorted Sets maintain order at write-time (O(log N) per ZADD), so reads
+    are O(log N + M) with zero sort cost, and results are already ranked.
+    A relational table would need an index scan + ORDER BY on every poll,
+    and would need external Pub/Sub (e.g., LISTEN/NOTIFY) bolted on for
+    real-time fan-out - Redis provides both primitives natively and
+    in-memory, which matters when seconds affect emergency response.
+
+Q2: How exactly does the Haversine formula calculate distance, and why not
+    simple Euclidean (Pythagorean) distance on lat/lng?
+A2: Haversine computes great-circle distance on a sphere using
+    a = sin²(Δφ/2) + cos φ1 · cos φ2 · sin²(Δλ/2), c = 2·atan2(√a, √(1−a)),
+    d = R·c. Latitude/longitude degrees are not evenly spaced in real-world
+    distance (a degree of longitude shrinks near the poles), so flat
+    Euclidean math on raw coordinates produces meaningfully wrong distances
+    at city/regional scale, which could misrank the "nearest" responder.
+
+Q3: Why WebSockets (Socket.io) instead of REST polling for live updates?
+A3: Polling forces every client to repeatedly ask "anything new?" on an
+    interval, adding latency up to the poll period and wasted requests when
+    nothing changed. WebSockets keep a persistent connection so the server
+    pushes updates the instant they occur - critical when a CRITICAL
+    incident must appear on every dispatcher's screen in near-zero time.
+
+Q4: How does HTML5 Drag & Drop prevent the browser from blocking a drop?
+A4: Browsers block drop events by default on most elements. Calling
+    event.preventDefault() inside the ondragover handler of the intended
+    drop target explicitly signals "this element accepts drops," which is
+    what allows the subsequent ondrop handler to fire and read the dragged
+    responder ID from the DataTransfer object.
+
+Q5: Describe the incident status lifecycle state machine and why it's
+    forward-only.
+A5: PENDING -> ASSIGNED -> EN_ROUTE -> ON_SCENE -> RESOLVED. It's modeled
+    forward-only (with a narrow exception path back to PENDING if a
+    responder is unassigned) so that queue position, UI state, and audit
+    history stay unambiguous - allowing arbitrary backward transitions would
+    let stale client events corrupt shared state across multiple connected
+    dispatchers.
+
+Q6: Why does the NLP Priority Engine run server-side rather than in the
+    browser?
+A6: Centralizing scoring guarantees every dispatcher and every downstream
+    system (Sorted Set, Pub/Sub, audit log) agrees on one authoritative
+    priority value; client-side scoring could drift or be spoofed, and
+    would require re-implementing/re-syncing the same logic in every
+    client.
+
+Q7: What happens if the Redis connection drops mid-operation?
+A7: The server falls back to an in-memory array-based queue (see Section 4)
+    so the app keeps functioning for active dispatchers already connected,
+    but loses cross-instance Pub/Sub fan-out and persistence across
+    restarts - this is a deliberate degrade-not-crash design, appropriate
+    for a life-safety tool, paired with a logged warning for ops visibility.
+
+Q8: Why use react-leaflet instead of driving Leaflet imperatively inside a
+    useEffect?
+A8: react-leaflet exposes map layers/markers as declarative React
+    components, so React's own reconciliation manages creation/teardown in
+    sync with component lifecycle - manual imperative Leaflet calls inside
+    useEffect are a common source of memory leaks and duplicate-marker bugs
+    on re-render.
+
+Q9: How is horizontal scaling (multiple server instances) handled without
+    dispatchers on different instances losing sync?
+A9: Redis Pub/Sub decouples state mutation from WebSocket emission - any
+    server instance can PUBLISH an event to a shared channel, and every
+    instance's subscriber re-emits it to its own locally connected Socket.io
+    clients, so all dispatchers stay in sync regardless of which instance
+    they're connected to.
+
+Q10: Why compute a "Top 3 Nearest Responders" list instead of always
+     auto-assigning the single closest unit?
+A10: Straight-line (Haversine) distance doesn't account for road network,
+     traffic, or a responder's current commitments; presenting the top 3
+     candidates keeps a human dispatcher in the loop for final judgment
+     while still using distance as a strong decision aid - appropriate for
+     a life-safety system where full automation carries risk.
+
+Q11: Why store timestamps in the Sorted Set score instead of a separate
+     field?
+A11: Combining priority_weight and timestamp into one numeric score lets a
+     single ZADD/ZREVRANGE operation return correctly ordered results
+     (priority first, recency second) without any secondary sort step,
+     keeping queue retrieval O(log N + M) instead of requiring a
+     multi-key sort in application code.
+
+Q12: What's the security consideration around exposing REDIS_URL or
+     JWT_SECRET?
+A12: Both are loaded via dotenv from a gitignored .env file and never
+     hardcoded or logged; REDIS_URL exposure could let an attacker read/
+     write the live incident queue, and JWT_SECRET exposure would let an
+     attacker forge dispatcher session tokens - both are treated as
+     production secrets requiring a secrets manager in deployment, not
+     plain .env files.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
